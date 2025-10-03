@@ -109,7 +109,6 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         # Short-lived lease cache so contains() can be followed by get() without
         # re-acquiring the lease. TTL 5 seconds by default.
         self._lease_cache: Dict[str, tuple[LeaseInfo, float]] = {}
-        self._lease_cache_lock = asyncio.Lock()
         self._lease_cache_ttl_ms = 5000
 
     # ------------------------------------------------------------------
@@ -126,8 +125,13 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             )
             timeout_s = (self.kv_config.lease_timeout_ms + 200) / 1000.0
             return future.result(timeout=timeout_s)
+        except asyncio.TimeoutError:
+            logger.warning(f"contains() timeout for key {key} after {timeout_s}s")
+            return False
         except Exception as exc:  # pragma: no cover - best effort logging
-            logger.warning(f"contains() failed for key {key}: {exc}")
+            exc_type = type(exc).__name__
+            exc_msg = str(exc) or "No message"
+            logger.warning(f"contains() failed for key {key}: {exc_type}: {exc_msg}")
             return False
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -268,7 +272,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
     ) -> int:
         if not keys:
             return 0
-
+        logger.info(f"batched_async_contains is called for keys {len(keys)}")
         # Process in concurrent windows to reduce total latency when many
         # leading keys exist. Early stop at first miss.
         window = max(1, min(32, self.kv_config.control_max_connections_per_host))
@@ -276,28 +280,22 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         i = 0
         while i < len(keys):
             batch = keys[i : i + window]
-            leases: list[Optional[LeaseInfo]] = [None] * len(batch)
-            missing_indices: list[int] = []
-            missing_tasks = []
-
-            for idx, key in enumerate(batch):
-                cached = await self._cache_peek_lease(key)
-                if cached is not None:
-                    leases[idx] = cached
-                    continue
-                missing_indices.append(idx)
-                missing_tasks.append(asyncio.create_task(self._acquire_lease(key)))
-
-            if missing_tasks:
-                results = await asyncio.gather(*missing_tasks, return_exceptions=True)
-                for idx, result in zip(missing_indices, results, strict=False):
-                    leases[idx] = None if isinstance(result, Exception) else result
-
-            for key, lease in zip(batch, leases, strict=False):
-                if lease is None:
+            
+            # Create tasks to acquire leases for all keys in the batch
+            tasks = [
+                asyncio.create_task(self._acquire_lease(key))
+                for key in batch
+            ]
+            
+            # Wait for all tasks to complete
+            leases = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Process results
+            for key, lease_result in zip(batch, leases, strict=False):
+                if isinstance(lease_result, Exception) or lease_result is None:
                     return total
                 # Cache lease for a short time; get() will reuse and release it
-                await self._cache_put_lease(key, lease)
+                await self._cache_put_lease(key, lease_result)
                 total += 1
             i += window
         return total
@@ -320,16 +318,13 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
     # ------------------------------------------------------------------
 
     async def _contains_async(self, key: CacheEngineKey) -> bool:
-        # Fast path: if a valid cached lease exists, treat as contained.
-        lease = await self._cache_peek_lease(key)
-        if lease is not None:
-            return True
-
         lease = await self._acquire_lease(key)
         if lease is None:
+            logger.info(f"_contains_async: Failed to acquire lease for key {key}")
             return False
         # Cache lease; do not release now. A following get() will consume it.
         await self._cache_put_lease(key, lease)
+        logger.info(f"_contains_async: Acquired and cached lease for key {key}")
         return True
 
     async def _put_once(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
@@ -338,8 +333,9 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         try:
             # Fast path: if we already have a valid cached lease for this key,
             # we know it exists. Skip the PUT without any HTTP call.
-            cached = await self._cache_peek_lease(key)
+            cached = await self._cache_get_lease(key)
             if cached is not None:
+                logger.info(f"_put_once: Skipping PUT for key {key} - already exists (cached lease)")
                 return
 
             await self._put_sema.acquire()
@@ -347,14 +343,21 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
 
             payload = await asyncio.to_thread(self._memory_obj_to_bytes, memory_obj)
             url = self._build_kv_url(key)
+            logger.info(f"_put_once: Sending PUT for key {key}, size={len(payload)} bytes")
             response = await self._data_http_request(
                 "PUT",
                 url,
                 data=payload,
                 timeout=self.kv_config.put_timeout_ms / 1000.0,
             )
-            if not response or response.get("status") != 200:
-                status = None if response is None else response.get("status")
+            if not response:
+                logger.error(f"PUT failed for key {key}: No response")
+            elif response.get("status") == 200:
+                logger.info(f"_put_once: PUT successful for key {key}")
+            elif response.get("status") == 409:
+                logger.info(f"_put_once: PUT returned 409 for key {key} - already exists")
+            else:
+                status = response.get("status")
                 logger.error(f"PUT failed for key {key}: HTTP {status}")
         except Exception as exc:  # pragma: no cover - log and continue
             logger.error(f"PUT exception for key {key}: {exc}")
@@ -366,9 +369,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
                 self._put_futures.pop(key_str, None)
 
     async def _get_memory_obj(self, key: CacheEngineKey) -> Optional[MemoryObj]:
-        lease = await self._cache_take_lease(key)
-        if lease is None:
-            lease = await self._acquire_lease(key)
+        lease = await self._acquire_lease(key)
         if lease is None:
             return None
         try:
@@ -379,85 +380,103 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
     async def _cache_put_lease(self, key: CacheEngineKey, lease: LeaseInfo) -> None:
         key_str = key.to_string()
         expiry = time.time() + (self._lease_cache_ttl_ms / 1000.0)
-        async with self._lease_cache_lock:
-            self._lease_cache[key_str] = (lease, expiry)
+        # Lock-free: Direct dictionary assignment
+        self._lease_cache[key_str] = (lease, expiry)
+        logger.info(f"_cache_put_lease: Cached lease for key {key}, TTL={self._lease_cache_ttl_ms}ms, lease_id={lease.lease_id}")
         # Schedule expiry; if not consumed by then, release it.
         asyncio.create_task(self._expire_lease_later(key_str, lease.lease_id, expiry))
 
-    async def _cache_take_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
-        key_str = key.to_string()
-        async with self._lease_cache_lock:
-            entry = self._lease_cache.pop(key_str, None)
-        if entry is None:
-            return None
-        lease, expiry = entry
-        if time.time() > expiry:
-            # Already expired; make sure it is released asynchronously
-            asyncio.create_task(self._release_lease(lease.lease_id))
-            return None
-        return lease
-
-    async def _cache_peek_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
-        """Return a cached lease without consuming it, if still valid.
-
-        If the cached lease is expired, remove it and schedule a release.
+    async def _cache_get_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
+        """Get a cached lease if still valid (lock-free).
+        
+        This is a unified method that replaces both take and peek operations.
         """
         key_str = key.to_string()
-        stale_lease_id: Optional[str] = None
-        async with self._lease_cache_lock:
-            entry = self._lease_cache.get(key_str)
-            if entry is None:
-                return None
-            lease, expiry = entry
-            if time.time() > expiry:
-                self._lease_cache.pop(key_str, None)
-                stale_lease_id = lease.lease_id
-            else:
-                return lease
-
-        if stale_lease_id is not None:
-            asyncio.create_task(self._release_lease(stale_lease_id))
-        return None
+        # Lock-free: Direct dictionary access
+        entry = self._lease_cache.get(key_str)
+        if entry is None:
+            logger.info(f"Lease cache miss for key {key}")
+            return None
+        
+        lease, expiry = entry
+        # Check if expired
+        if time.time() > expiry:
+            logger.info(f"Lease cache expired for key {key}, lease_id={lease.lease_id}")
+            # Best-effort removal - race condition is acceptable
+            self._lease_cache.pop(key_str, None)
+            # Schedule release asynchronously
+            asyncio.create_task(self._release_lease(lease.lease_id))
+            return None
+        
+        logger.info(f"Lease cache hit for key {key}, lease_id={lease.lease_id}")
+        return lease
 
     async def _expire_lease_later(self, key_str: str, lease_id: str, expiry: float) -> None:
         try:
             delay = max(0.0, expiry - time.time())
             if delay > 0:
                 await asyncio.sleep(delay)
-            async with self._lease_cache_lock:
-                # If still cached and expired, pop and release
-                entry = self._lease_cache.get(key_str)
-                if entry is None:
-                    return
-                cached_lease, cached_expiry = entry
-                if time.time() >= cached_expiry:
-                    self._lease_cache.pop(key_str, None)
-                else:
-                    return
+            # Lock-free: Direct dictionary access
+            entry = self._lease_cache.get(key_str)
+            if entry is None:
+                return
+            cached_lease, cached_expiry = entry
+            if time.time() >= cached_expiry:
+                # Best-effort removal - race condition is acceptable
+                self._lease_cache.pop(key_str, None)
+            else:
+                return
         finally:
             # Release regardless; server treats duplicate/late releases as harmless
             await self._release_lease(lease_id)
 
     async def _acquire_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
+        """Acquire a lease, checking cache first.
+        
+        All operations now behave the same - no distinction between peek and take.
+        """
+        # Check cache first (unified behavior)
+        cached_lease = await self._cache_get_lease(key)
+        if cached_lease is not None:
+            logger.info(f"_acquire_lease: Cache hit for key {key}, lease_id={cached_lease.lease_id}")
+            return cached_lease
+
+        # Cache miss, acquire new lease from server
         url = f"{self.kv_config.base_url}/v1/kv/{self.kv_config.bucket_name}/{self._key_to_string(key)}/leases"
         params = {"timeout_ms": self.kv_config.lease_timeout_ms}
+        logger.info(f"_acquire_lease: Cache miss, acquiring new lease for key {key}, timeout={self.kv_config.lease_timeout_ms}ms")
         response = await self._control_http_request(
             "POST",
             url,
             params=params,
             timeout=self.kv_config.lease_timeout_ms / 1000.0,
         )
-        if not response or response.get("status") != 200 or not response.get("json"):
+        if not response:
+            logger.info(f"_acquire_lease: No response for key {key}")
             return None
+        
+        status = response.get("status")
+        if status != 200:
+            logger.info(f"_acquire_lease: Failed with status {status} for key {key}")
+            return None
+        
+        if not response.get("json"):
+            logger.info(f"_acquire_lease: No JSON in response for key {key}")
+            return None
+            
         data = response["json"]
         offsets = [(chunk["offset"], chunk["len"]) for chunk in data.get("offsets", [])]
         if not offsets:
+            logger.info(f"_acquire_lease: No offsets in response for key {key}")
             return None
-        return LeaseInfo(
+        
+        lease_info = LeaseInfo(
             lease_id=data["id"],
             offsets=offsets,
             total_size=sum(length for _, length in offsets),
         )
+        logger.info(f"_acquire_lease: Successfully acquired new lease for key {key}, lease_id={lease_info.lease_id}, total_size={lease_info.total_size}")
+        return lease_info
 
     async def _release_lease(self, lease_id: str) -> bool:
         url = f"{self.kv_config.base_url}/v1/leases/{lease_id}/release"
