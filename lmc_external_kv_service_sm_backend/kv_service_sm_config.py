@@ -53,7 +53,7 @@ class KVServiceSMConfig:
     # Client-side streaming / diagnostics
     put_stream_concurrency: int = 64
     put_stream_chunk_bytes: int = 4 * 1024 * 1024
-    trace_enabled: bool = True
+    trace_enabled: bool = False
 
     @classmethod
     def from_extra_config(cls, extra_config: Optional[dict]) -> "KVServiceSMConfig":
