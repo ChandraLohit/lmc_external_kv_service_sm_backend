@@ -498,8 +498,23 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             else:
                 # Real failure (timeout, 500, etc.)
                 status = None if response is None else response.get("status")
-                error_msg = None if response is None else response.get("json")
-                logger.error(f"PUT failed for {key}: HTTP {status}, error: {error_msg}")
+                error_json = None if response is None else response.get("json")
+                error_text = None if response is None else response.get("text")
+                request_url = None if response is None else response.get("url")
+                
+                # Build comprehensive error message
+                error_parts = []
+                if error_json is not None:
+                    error_parts.append(f"json={error_json}")
+                if error_text is not None:
+                    # Truncate long text responses
+                    text_preview = error_text[:200] if len(error_text) > 200 else error_text
+                    error_parts.append(f"text={text_preview!r}")
+                if request_url is not None:
+                    error_parts.append(f"url={request_url}")
+                
+                error_details = ", ".join(error_parts) if error_parts else "no details"
+                logger.error(f"PUT failed for {key}: HTTP {status}, {error_details}")
 
             status = None if response is None else response.get("status")
             self._trace_put_event(
@@ -707,12 +722,28 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             ) as response:
                 content_type = response.headers.get("Content-Type", "")
                 body_json = None
+                body_text = None
+                
+                # Try to parse JSON first
                 if content_type.startswith("application/json"):
                     try:
                         body_json = await response.json()
                     except Exception:
                         body_json = None
-                return {"status": response.status, "json": body_json}
+                
+                # For non-2xx status codes or if JSON parsing failed, also get text
+                if response.status >= 400 or body_json is None:
+                    try:
+                        body_text = await response.text()
+                    except Exception:
+                        body_text = None
+                
+                return {
+                    "status": response.status,
+                    "json": body_json,
+                    "text": body_text,
+                    "url": str(url),
+                }
         except asyncio.TimeoutError:
             logger.warning(f"HTTP {method} timeout talking to {url}")
             return None

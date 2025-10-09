@@ -37,7 +37,7 @@ class KVServiceSMConfig:
     put_max_connections_per_host: int = 256
 
     # Timeout settings (milliseconds)
-    lease_timeout_ms: int = 500
+    lease_timeout_ms: int = 2000
     put_timeout_ms: int = 20000
     http_connect_timeout_ms: int = 5000
     http_read_timeout_ms: int = 10000
