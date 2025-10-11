@@ -808,8 +808,8 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             logger.error("Invalid payload length %d for key %s", payload_len, key)
             return None
 
-        # 3) Allocate destination
-        memory_obj = self.memory_allocator.allocate(
+        # 3) Allocate destination through LocalCPUBackend to get eviction logic
+        memory_obj = self.local_cpu_backend.allocate(
             metadata.shape,
             metadata.dtype,
             metadata.fmt,
